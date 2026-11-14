@@ -1,7 +1,10 @@
 # Using the Claude Agent tools well
 
 Read this before any technical work on the Miyoo (docs {"topic":"agent"}). Other topics: hardware (the
-devices), onionos (the system and its files), drastic (Nintendo DS emulator), ports (making and testing ports).
+devices), onionos (the system and its files), drastic (Nintendo DS emulator), ports (making and testing ports,
+living with OnionOS), performance (what made ports faster or smoother on this hardware, with measured numbers,
+what failed, and a checklist: read it before any speed, smoothness or battery work), emulators (systems, folders,
+cores, BIOS, saves, RetroArch settings and troubleshooting), scraping (box art and game names).
 These notes are for you, not for the person: explain things to them in plain words.
 
 ## How the connection works

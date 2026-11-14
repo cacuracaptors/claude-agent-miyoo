@@ -11,7 +11,7 @@
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import { DurableObject } from 'cloudflare:workers';
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 const SCOPE = 'miyoo';
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
 const MAX_TOOL_WAIT_MS = 720 * 1000;
@@ -23,7 +23,8 @@ const RECONNECT_WAIT_MS = 20 * 1000;
 const LATE_KEEP_MS = 30 * 60 * 1000;
 
 const SERVER_INSTRUCTIONS = `These tools control a Miyoo Mini handheld (Linux, ARM, OnionOS or RedOnion) owned by the user you are talking to.
-- Start with device_info and a screenshot to see the state of the device. Before technical work (fixing the system, testing games or ports, emulators, performance), read the docs tool: topic agent, then the topic that matches the task. Those notes are for you, not for the user.
+- This app has internal notes written for you (the docs tool): how to use these tools well, the Miyoo hardware, OnionOS/RedOnion (shortcuts, apps, Wi-Fi features, recovery), the emulators (folders, cores, BIOS, saves, RetroArch settings, troubleshooting), box art and game names (scraping), DraStic, making ports, and measured performance techniques for this hardware (what worked, what did not). Before helping with the system, games, emulators, ports or apps, read docs topic agent, then the topic that matches the task; read topic performance before any speed, smoothness or battery work. Those notes are for you, not for the user.
+- Start with device_info and a screenshot to see the state of the device.
 - The user may not be technical: explain in plain words what you are about to change before changing system files, and say what you changed afterwards.
 - Check your work: take a screenshot after pressing buttons or launching something.
 - Do not press POWER unless the user asks; it can put the device to sleep or turn it off, and then you lose the connection.

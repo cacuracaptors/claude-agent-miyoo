@@ -392,8 +392,9 @@ static cJSON *tool_device_info(cJSON *args)
                   "to 1600 MHz. No Wi-Fi: this agent normally cannot run on it. 128 MB RAM."
                 : "Mini v2/v3: 2.8 inch 640x480 screen. CPU up to 1600 MHz. No Wi-Fi. 128 MB RAM.");
     cJSON_AddItemToObject(o, "profile", pf);
-    cJSON_AddStringToObject(o, "docs", "Notes for you on this device, OnionOS, DraStic, ports and these tools: "
-                                       "call docs (topic agent first).");
+    cJSON_AddStringToObject(o, "docs", "Notes for you on this device, OnionOS/RedOnion, emulators, box art, "
+                                       "DraStic, ports, performance work and these tools: call docs (topic agent "
+                                       "first, performance before optimizing anything).");
 
     /* firmware: RedOnion ships its own website.txt */
     char ver[64] = "", site[256] = "";
@@ -1586,8 +1587,12 @@ static const struct {
     {"docs", tool_docs,
      "Notes for you (not for the person) about this kind of device and how to work on it: how to use these tools "
      "well (topic agent), the Miyoo hardware (hardware), OnionOS / RedOnion and where things are (onionos), the "
-     "DraStic emulator with frame-exact input replays (drastic), making and testing ports (ports). Read agent before "
-     "technical work, and the topic that matches the task. No topic lists them.",
+     "DraStic emulator with frame-exact input replays (drastic), making and testing ports and fitting them into "
+     "OnionOS (ports), measured performance techniques for this hardware with what worked and what did not "
+     "(performance), the emulators with their folders, cores, BIOS, saves and RetroArch settings (emulators), and box "
+     "art and game names (scraping). Read agent before technical work, and the topic that matches the task "
+     "(performance before any speed, smoothness or battery work; emulators or scraping when helping a player). No "
+     "topic lists them.",
      "{\"type\":\"object\",\"properties\":{\"topic\":{\"type\":\"string\"}}}", 0},
     {"set_status", tool_set_status,
      "Show one short line on the Miyoo screen (in the Claude Agent app) about what you are doing, for example "

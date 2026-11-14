@@ -80,7 +80,7 @@ To see the full format, ask Claude to show the plugin docs (the `plugins` tool w
 | `snapshot` | Saves a folder (like a save folder) and restores it later |
 | `plugin_create` / `plugins` | Creates and manages [plugins](#plugins) |
 
-Claude also has built-in notes about the Miyoo hardware, OnionOS and RedOnion, DraStic and making ports (the `docs` tool, files in `app/docs/`), so it does not have to rediscover how the device works in every chat. For DraStic, `run_app` can start every run from the same save state and use DraStic's own frame-exact input recording, so a test or a bug can be replayed exactly.
+Claude also has built-in notes about the Miyoo hardware, OnionOS and RedOnion, the emulators (folders, cores, BIOS, saves), box art scraping, DraStic, making ports, and performance techniques measured on this hardware in real ports (what worked, what did not, with numbers), in the `docs` tool (files in `app/docs/`). So it starts from what is already known instead of rediscovering the device in every chat, whether a developer is optimizing a port or a player wants a game to run better. For DraStic, `run_app` can start every run from the same save state and use DraStic's own frame-exact input recording, so a test or a bug can be replayed exactly.
 
 ## Languages
 
