@@ -559,6 +559,9 @@ Grabación '%s' detenida: %d eventos de botón
 Recording buttons as '%s'
 Grabando los botones como '%s'
 
+Recording '%s' from now
+Grabando '%s' desde ahora
+
 Replay of %s %s: %d button events, %d screenshots
 Repetición de %s %s: %d eventos de botón, %d capturas
 

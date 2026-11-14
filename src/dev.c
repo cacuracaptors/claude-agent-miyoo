@@ -31,7 +31,7 @@
 #include "common.h"
 #include "mbedtls/sha256.h"
 
-#define JOB_WAIT_MS 100000 /* a call waits this long for its job, then returns the job id */
+#define JOB_WAIT_MS 50000 /* a call waits this long for its job, then returns the job id */
 
 /* ------------------------------------------------------------------ jobs */
 
@@ -150,8 +150,8 @@ cJSON *tool_job_status(cJSON *args)
     int id = (int)arg_num(args, "id", 0);
     int cancel = arg_bool(args, "cancel", 0);
     int wait_s = (int)arg_num(args, "wait_s", 0);
-    if (wait_s > 90)
-        wait_s = 90;
+    if (wait_s > 50)
+        wait_s = 50;
     if (!id) {
         cJSON *r = result_new();
         char buf[4000] = "";
@@ -456,6 +456,89 @@ static const char *input_dev(void)
     return getenv("CA_INPUT") ? getenv("CA_INPUT") : "/dev/input/event0";
 }
 
+/* --- start_on: count time from a line of output (the game finished loading), not from the call */
+
+typedef struct {
+    char text[120];
+    char file[1100];
+    long off;       /* read from here (-1: from the end when the wait starts) */
+    int timeout_ms;
+} start_on_t;
+
+/* from the tool's arguments; NULL = not used, or an error to return */
+static cJSON *start_on_args(cJSON *args, start_on_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    const char *text = arg_str(args, "start_on", NULL);
+    if (!text || !*text)
+        return NULL;
+    if (strlen(text) >= sizeof(s->text))
+        return result_error("'start_on' is too long (up to %d characters)", (int)sizeof(s->text) - 1);
+    snprintf(s->text, sizeof(s->text), "%s", text);
+    const char *file = arg_str(args, "start_on_file", NULL);
+    if (file && *file) {
+        snprintf(s->file, sizeof(s->file), "%s", file);
+        struct stat st;
+        s->off = stat(file, &st) == 0 ? (long)st.st_size : 0; /* only lines written from now on */
+    }
+    else if (run_output_path(s->file, sizeof(s->file)) == 0)
+        s->off = 0; /* the run's own output: from its start */
+    else
+        return result_error("start_on looks at the output of the program run_app is running, and none is running. "
+                            "Start it first with run_app (wait false), or give start_on_file (a log file).");
+    int to = (int)arg_num(args, "start_timeout_s", 90);
+    s->timeout_ms = (to < 1 ? 1 : to > 600 ? 600 : to) * 1000;
+    return NULL;
+}
+
+/* waits until s->text is written to s->file: 0 found, -1 timed out, -2 cancelled */
+static int start_on_wait(job_t *j, const start_on_t *s)
+{
+    char note[200];
+    snprintf(note, sizeof(note), "waiting for \"%.60s\" in %s", s->text, strrchr(s->file, '/') ? strrchr(s->file, '/') + 1 : s->file);
+    job_progress(j, "%s", note);
+    size_t tl = strlen(s->text), keep = 0;
+    char buf[4096 + 128];
+    long long until = now_ms() + s->timeout_ms;
+    int fd = -1, rc = -1;
+    while (now_ms() < until) {
+        if (j->cancel) {
+            rc = -2;
+            break;
+        }
+        if (fd < 0) {
+            fd = open(s->file, O_RDONLY);
+            if (fd >= 0 && s->off > 0)
+                lseek(fd, s->off, SEEK_SET);
+        }
+        ssize_t n = fd >= 0 ? read(fd, buf + keep, 4096) : 0;
+        if (n <= 0) {
+            sleep_ms(20); /* 20 ms: the replay starts at most this late */
+            continue;
+        }
+        size_t len = keep + (size_t)n;
+        if (memmem(buf, len, s->text, tl)) {
+            rc = 0;
+            break;
+        }
+        keep = tl - 1 < len ? tl - 1 : len; /* a line split between two reads */
+        memmove(buf, buf + len - keep, keep);
+    }
+    if (fd >= 0)
+        close(fd);
+    return rc;
+}
+
+static cJSON *start_on_failed(const start_on_t *s, int rc, const char *what)
+{
+    if (rc == -2)
+        return result_error("cancelled while waiting for \"%s\"; %s did not start", s->text, what);
+    return result_error("\"%s\" did not appear in %s within %d s, so %s did not start. Check the exact words in "
+                        "the file (read_file), and that the program writes them while it runs: some programs "
+                        "keep their output and write it only when they end.",
+                        s->text, s->file, s->timeout_ms / 1000, what);
+}
+
 /* --- recording */
 
 typedef struct {
@@ -463,12 +546,23 @@ typedef struct {
     char path[1200];
     int max_s;
     int count;
+    start_on_t start;
 } rec_t;
 
 static void *record_thread(void *arg)
 {
     job_t *j = arg;
     rec_t *rc = j->arg;
+    if (rc->start.text[0]) {
+        int w = start_on_wait(j, &rc->start);
+        if (w != 0) {
+            job_finish(j, start_on_failed(&rc->start, w, "the recording"));
+            free(rc);
+            return NULL;
+        }
+        activity("Recording '%s' from now", rc->name);
+        job_progress(j, "recording, 0 presses, 0 s");
+    }
     int fd = open(input_dev(), O_RDONLY | O_NONBLOCK);
     FILE *f = fopen(rc->path, "w");
     if (fd < 0 || !f) {
@@ -483,7 +577,10 @@ static void *record_thread(void *arg)
     time_t now = time(NULL);
     char when[64];
     strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", localtime(&now));
-    fprintf(f, "# Claude Agent input recording v1, %s\n# ms button down|up\n", when);
+    fprintf(f, "# Claude Agent input recording v1, %s\n", when);
+    if (rc->start.text[0])
+        fprintf(f, "# times count from the line \"%s\" (replay it with the same start_on)\n", rc->start.text);
+    fprintf(f, "# ms button down|up\n");
     long long t0 = now_ms(), last_note = 0;
     int first = -1, last = 0;
     while (!j->cancel && now_ms() - t0 < (long long)rc->max_s * 1000) {
@@ -561,7 +658,12 @@ cJSON *tool_input_record(cJSON *args)
     const char *name = arg_str(args, "name", NULL);
     if (!name_ok(name))
         return result_error("'name' is required: letters, digits, - and _ only (for example level1_run)");
+    start_on_t so;
+    cJSON *serr = start_on_args(args, &so);
+    if (serr)
+        return serr;
     rec_t *rc = calloc(1, sizeof(*rc));
+    rc->start = so;
     snprintf(rc->name, sizeof(rc->name), "%s", name);
     snprintf(rc->path, sizeof(rc->path), "%s/%s.txt", recordings_dir(), name);
     rc->max_s = (int)arg_num(args, "max_s", 600);
@@ -576,10 +678,17 @@ cJSON *tool_input_record(cJSON *args)
         return result_error("out of memory");
     activity("Recording buttons as '%s'", name);
     cJSON *r = result_new();
-    result_textf(r,
-                 "Recording started (job %d), saving to %s. Every button the person presses is recorded with its "
-                 "time, for up to %d s. Call input_record with action stop when they are done.",
-                 j->id, rc->path, rc->max_s);
+    if (so.text[0])
+        result_textf(r,
+                     "Recording job %d is waiting for \"%s\" in %s (up to %d s). From then on, every button the "
+                     "person presses is recorded with its time, for up to %d s, to %s. Call input_record with "
+                     "action stop when they are done (job_status shows whether it started).",
+                     j->id, so.text, so.file, so.timeout_ms / 1000, rc->max_s, rc->path);
+    else
+        result_textf(r,
+                     "Recording started (job %d), saving to %s. Every button the person presses is recorded with its "
+                     "time, for up to %d s. Call input_record with action stop when they are done.",
+                     j->id, rc->path, rc->max_s);
     return r;
 }
 
@@ -591,6 +700,7 @@ typedef struct {
     char source[100];
     char shots_dir[1100];
     int allow_power;
+    start_on_t start;
 } play_t;
 
 typedef struct {
@@ -670,6 +780,20 @@ static void *play_thread(void *arg)
         free(p);
         return NULL;
     }
+    long long waited = 0;
+    if (p->start.text[0]) { /* the person's buttons still work while the game loads */
+        long long w0 = now_ms();
+        int w = start_on_wait(j, &p->start);
+        if (w != 0) {
+            close(fd);
+            job_finish(j, start_on_failed(&p->start, w, "the replay"));
+            free(p->ev);
+            free(p);
+            return NULL;
+        }
+        waited = now_ms() - w0;
+    }
+    keys_hold(1);
     char held[KEY_MAX / 8 + 1];
     memset(held, 0, sizeof(held));
     int sent = 0, shots = 0, late_max = 0, late_sum = 0, late_n = 0;
@@ -735,6 +859,7 @@ static void *play_thread(void *arg)
     for (int c = 0; c < KEY_MAX; c++)
         if (held[c / 8] & (1 << (c % 8)))
             emit_key(fd, c, 0);
+    keys_hold(0);
     close(fd);
     sleep_ms(600); /* let the last screenshots finish */
     cJSON *r = result_new();
@@ -744,6 +869,9 @@ static void *play_thread(void *arg)
                  j->cancel ? "Cancelled the replay of" : "Replayed", p->source, sent, ms_since(&t0) / 1000.0,
                  late_n ? (double)late_sum / late_n : 0.0, late_max,
                  shots ? "\nScreenshots (look at them with view_image):" : "", shot_list);
+    if (p->start.text[0])
+        result_textf(r, "Time 0 was when \"%s\" appeared, %.1f s after the replay was asked for.", p->start.text,
+                     waited / 1000.0);
     activity("Replay of %s %s: %d button events, %d screenshots", p->source, T(j->cancel ? "cancelled" : "done"), sent,
              shots);
     job_progress(j, "%s", j->cancel ? "cancelled" : "done");
@@ -814,6 +942,10 @@ cJSON *tool_input_play(cJSON *args)
     if (!rec == !tl)
         return result_error("give either 'recording' (a name) or 'timeline' (a list of events)");
     int allow_power = arg_bool(args, "allow_power", 0);
+    start_on_t so;
+    cJSON *serr = start_on_args(args, &so);
+    if (serr)
+        return serr;
 
     play_t *p = calloc(1, sizeof(*p));
     p->ev = calloc(MAX_EVENTS, sizeof(ev_t));
@@ -900,6 +1032,7 @@ cJSON *tool_input_play(cJSON *args)
     }
     qsort(p->ev, p->n, sizeof(ev_t), ev_cmp);
     p->allow_power = allow_power;
+    p->start = so;
     time_t now = time(NULL);
     char stamp[32];
     strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", localtime(&now));
@@ -918,8 +1051,9 @@ cJSON *tool_input_play(cJSON *args)
             }
             break;
         }
-    char what[200];
-    snprintf(what, sizeof(what), "replay %s (%.1f s)", p->source, p->ev[p->n - 1].t / 1000.0);
+    char what[300];
+    snprintf(what, sizeof(what), "replay %s (%.1f s)%s%.60s%s", p->source, p->ev[p->n - 1].t / 1000.0,
+             so.text[0] ? " from \"" : "", so.text, so.text[0] ? "\"" : "");
     job_t *j = job_start("play", what, play_thread, p);
     if (!j)
         return result_error("out of memory");

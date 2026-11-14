@@ -29,7 +29,26 @@
 #include "cJSON.h"
 #include "common.h"
 
-#define JOB_WAIT_MS 100000
+#define JOB_WAIT_MS 50000 /* answer before Claude's side gives up (about 100 s with the relay's own waits) */
+
+/* the output of the program run_app is running, for input_play / input_record (start_on) */
+static pthread_mutex_t run_out_lock = PTHREAD_MUTEX_INITIALIZER;
+static char run_out[1100];
+
+int run_output_path(char *out, size_t size)
+{
+    pthread_mutex_lock(&run_out_lock);
+    snprintf(out, size, "%s", run_out);
+    pthread_mutex_unlock(&run_out_lock);
+    return out[0] ? 0 : -1;
+}
+
+static void run_out_set(const char *path)
+{
+    pthread_mutex_lock(&run_out_lock);
+    snprintf(run_out, sizeof(run_out), "%s", path ? path : "");
+    pthread_mutex_unlock(&run_out_lock);
+}
 #define RUN_PID "/tmp/claude_agent_run.pid"
 #define RUN_RC "/tmp/claude_agent_run.rc"
 
@@ -182,7 +201,60 @@ typedef struct {
     int shot_every, shot_start, shot_count;
     int core, reopen;
     char core_pattern_old[256];
+    int kmsg;          /* kernel log, read from the start of the run: crashes of any program it starts */
+    char pfs_old[16];  /* print-fatal-signals before the run */
 } run_t;
+
+#define FATAL_SIGNALS "/proc/sys/kernel/print-fatal-signals"
+
+/* The launch script (launch.sh) often ends normally even when the program it started crashed. The
+   kernel can log every fatal signal (print-fatal-signals); this reads what it logged during the run:
+   the first program that crashed, and memory kills. */
+static int kmsg_crash(run_t *r, char *who, size_t who_size, char *notes, size_t notes_size)
+{
+    int sig = 0;
+    size_t nl = 0;
+    char rec[1024];
+    who[0] = notes[0] = 0;
+    if (r->kmsg < 0)
+        return 0;
+    ssize_t n;
+    while ((n = read(r->kmsg, rec, sizeof(rec) - 1)) != 0) {
+        if (n < 0) {
+            if (errno == EPIPE) /* overwritten records: go on */
+                continue;
+            break; /* EAGAIN: no more */
+        }
+        rec[n] = 0;
+        char *msg = strchr(rec, ';');
+        if (!msg)
+            continue;
+        msg++;
+        msg[strcspn(msg, "\n")] = 0;
+        char comm[64];
+        int pid = 0, s = 0;
+        char *p = strstr(msg, ": potentially unexpected fatal signal ");
+        if (p && sscanf(p, ": potentially unexpected fatal signal %d", &s) == 1) {
+            snprintf(comm, sizeof(comm), "%.*s", (int)(p - msg) < 63 ? (int)(p - msg) : 63, msg);
+            char *slash = strrchr(comm, '/');
+            if (slash) {
+                pid = atoi(slash + 1);
+                *slash = 0;
+            }
+            if (!sig) {
+                sig = s;
+                snprintf(who, who_size, "%s (pid %d)", comm, pid);
+            }
+        }
+        else if (strstr(msg, "Out of memory") || strstr(msg, "Killed process") || strstr(msg, "oom-killer"))
+            nl += snprintf(notes + nl, nl < notes_size ? notes_size - nl : 0, "\n  kernel: %.200s", msg);
+        if (nl >= notes_size)
+            nl = notes_size - 1;
+    }
+    close(r->kmsg);
+    r->kmsg = -1;
+    return sig;
+}
 
 /* After a run: open the Claude Agent app again if it was open before, so the person can answer
    questions (permissions, plugin installs) on the Miyoo. Same steps as opening it from the menu. */
@@ -236,6 +308,18 @@ static void *run_thread(void *arg)
         result_textf(res, "The program did not start within 30 s. Is MainUI on screen (not a game or another app)?");
         cJSON_AddBoolToObject(res, "isError", 1);
         job_finish(j, res);
+        if (r->kmsg >= 0)
+            close(r->kmsg);
+        FILE *pf;
+        if (r->pfs_old[0] && (pf = fopen(FATAL_SIGNALS, "w"))) {
+            fputs(r->pfs_old, pf);
+            fclose(pf);
+        }
+        if (r->core_pattern_old[0] && (pf = fopen("/proc/sys/kernel/core_pattern", "w"))) {
+            fputs(r->core_pattern_old, pf);
+            fclose(pf);
+        }
+        run_out_set(NULL);
         free(r);
         return NULL;
     }
@@ -318,6 +402,20 @@ static void *run_thread(void *arg)
     double secs = (now_ms() - start) / 1000.0;
     int sig = rc > 128 && rc < 160 ? rc - 128 : 0;
     int crashed = sig && sig != SIGTERM && sig != SIGKILL && sig != SIGINT;
+    char who[100], knotes[800];
+    int ksig = kmsg_crash(r, who, sizeof(who), knotes, sizeof(knotes));
+    if (r->pfs_old[0]) { /* put the system setting back */
+        FILE *pf = fopen(FATAL_SIGNALS, "w");
+        if (pf) {
+            fputs(r->pfs_old, pf);
+            fclose(pf);
+        }
+    }
+    int inner = 0; /* the crash was of a program the script started, not of the script */
+    if (ksig && !crashed && !j->cancel && !timed_out) {
+        crashed = inner = 1;
+        sig = ksig;
+    }
     if (crashed && last_raw) {
         char p[1300];
         snprintf(p, sizeof(p), "%s/last_frame.png", r->dir);
@@ -370,17 +468,20 @@ static void *run_thread(void *arg)
         snprintf(how, sizeof(how), "stopped after the time limit of %d s", r->timeout_s);
     else if (r->stop_on_match && matched)
         snprintf(how, sizeof(how), "stopped when its output matched");
+    else if (crashed && inner)
+        snprintf(how, sizeof(how), "CRASHED: %s died with %s (the launch script itself then ended with code %d)",
+                 who, sig < 16 ? names[sig] : "a signal", rc);
     else if (crashed)
         snprintf(how, sizeof(how), "CRASHED with %s", sig < 16 ? names[sig] : "a signal");
     else if (rc >= 0)
         snprintf(how, sizeof(how), "exited with code %d", rc);
     else
         snprintf(how, sizeof(how), "ended (exit code unknown)");
-    result_textf(res, "%s: %s after %.1f s. Output saved in %s/output.log.%s%s%s%s%s%s\nLast lines:\n%s", r->what,
+    result_textf(res, "%s: %s after %.1f s. Output saved in %s/output.log.%s%s%s%s%s%s%s\nLast lines:\n%s", r->what,
                  how, secs, r->dir, shots ? " Screenshots in that folder." : "",
                  crashed ? " last_frame.png shows the screen about a second before the crash." : "",
                  matched ? "\nMatches:" : "", matches, cores[0] ? "\nCore dump (open it with gdb and the program): " : "",
-                 cores, tail[0] ? tail : "(no output)");
+                 cores, knotes, tail[0] ? tail : "(no output)");
     activity("Run ended: %s, %s", r->what, how);
     unlink(RUN_PID);
     unlink(RUN_RC);
@@ -389,10 +490,15 @@ static void *run_thread(void *arg)
             activity("Reopened Claude Agent");
             result_textf(res, "The Claude Agent app is open again on the Miyoo, so the person can answer questions there.");
         }
+        else if (pid_of("gameSwitcher"))
+            result_textf(res, "Note: the Claude Agent app could not be reopened because OnionOS's GameSwitcher is on "
+                              "screen (MENU was pressed in the game). Press B there (press_buttons) to go back to "
+                              "the main menu, then ask the person to open the app if needed.");
         else
             result_textf(res, "Note: the Claude Agent app could not be reopened. If you need the person to confirm "
                               "something on the Miyoo, ask them to open it (Apps > Claude Agent).");
     }
+    run_out_set(NULL);
     free(r);
     job_finish(j, res);
     return NULL;
@@ -495,6 +601,22 @@ cJSON *tool_run_app(cJSON *args)
     fclose(f);
     chmod(script, 0755);
 
+    /* crashes of the programs the script starts: the kernel logs them during the run */
+    r->kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+    if (r->kmsg >= 0)
+        lseek(r->kmsg, 0, SEEK_END);
+    {
+        FILE *pf = fopen(FATAL_SIGNALS, "r");
+        if (pf) {
+            if (!fgets(r->pfs_old, sizeof(r->pfs_old), pf))
+                r->pfs_old[0] = 0;
+            fclose(pf);
+        }
+        if (r->pfs_old[0] && (pf = fopen(FATAL_SIGNALS, "w"))) {
+            fputs("1", pf);
+            fclose(pf);
+        }
+    }
     if (r->core) { /* cores go to the run folder, for this run only */
         FILE *cp = fopen("/proc/sys/kernel/core_pattern", "r");
         if (cp) {
@@ -548,9 +670,16 @@ cJSON *tool_run_app(cJSON *args)
             execl("/bin/sh", "sh", script, (char *)NULL);
             _exit(127);
         }
+    char outp[1100];
+    snprintf(outp, sizeof(outp), "%s/output.log", r->dir);
+    run_out_set(outp); /* for input_play / input_record start_on, called right after */
     job_t *j = job_start("run", r->what, run_thread, r);
-    if (!j)
+    if (!j) {
+        run_out_set(NULL);
+        if (r->kmsg >= 0)
+            close(r->kmsg);
         return result_error("out of memory");
+    }
     return job_wait(j, arg_bool(args, "wait", 1) ? JOB_WAIT_MS : 0);
 }
 

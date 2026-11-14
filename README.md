@@ -42,7 +42,7 @@ The app shows a QR code, a site address and a 6-digit code.
 2. Follow the steps on that page: it adds the Miyoo connector to your Claude account.
 3. When asked, type the code shown on the Miyoo.
 
-That's it. Now open a chat in Claude with the Miyoo connector turned on and ask anything about your Miyoo. The app on the Miyoo shows Claude's answers and, step by step, everything it does.
+That's it. Now open a chat in Claude with the Miyoo connector turned on and ask anything about your Miyoo. The app on the Miyoo shows Claude's answers and, step by step, everything it does. When Claude works for a while without touching the Miyoo (reading, writing a fix), a short line next to *Activity* says what it is doing.
 
 Tip: in Claude's settings, the connector has an "Always allow" option, if you do not want Claude to ask you before each action on the chat side too.
 
@@ -73,7 +73,7 @@ To see the full format, ask Claude to show the plugin docs (the `plugins` tool w
 | --- | --- |
 | `download_file` | Downloads a file (a new build, a big asset) straight to the SD card, with SHA-256 check |
 | `run_app` | Launches a game or app the way OnionOS does, with a time limit, a CPU clock, words to watch for in the output, screenshots, and crash reports (signal, last log lines, last frame, core dump) |
-| `input_record` / `input_play` | Records the buttons you press and replays them with exact timing, plus screenshots at set moments: the same test, the same way, every time |
+| `input_record` / `input_play` | Records the buttons you press and replays them with exact timing, plus screenshots at set moments: the same test, the same way, every time. Buttons are held for real, so games and emulators see them. Both can start counting when the game prints a given line (for example when a save state has loaded), so loading times do not shift the timing |
 | `perf_monitor` | CPU use, real CPU clock, memory, battery, saved as CSV |
 | `screen_capture` | Screenshots every N ms, for a while |
 | `watch_file` | Follows a log file and stops on the words you choose |
@@ -90,7 +90,7 @@ The app checks for a new version once each time the Miyoo is turned on (with Wi-
 
 ## How it works
 
-The Miyoo cannot be reached directly from the internet, so the app keeps one secure connection open to a small relay (a Cloudflare Worker, in [`server/`](server)). Claude's connector talks to the same relay, which passes the requests to the Miyoo and the answers back. The relay keeps only what the connection needs: for each Miyoo, an ID, a hashed key, the list of its tools and a short summary (model, system version, battery, free space), plus the connector's tokens, which Cloudflare's OAuth library stores only as hashes. Your files and messages pass through it but are not kept.
+The Miyoo cannot be reached directly from the internet, so the app keeps one secure connection open to a small relay (a Cloudflare Worker, in [`server/`](server)). Claude's connector talks to the same relay, which passes the requests to the Miyoo and the answers back. The relay keeps only what the connection needs: for each Miyoo, an ID, a hashed key, the list of its tools and a short summary (model, system version, battery, free space), plus the connector's tokens, which Cloudflare's OAuth library stores only as hashes. Your files and messages pass through it but are not kept. The one exception is an answer that takes longer than about a minute (a long test, a big download): the relay keeps it until Claude picks it up, for 30 minutes at most. If the Miyoo's Wi-Fi drops for a moment, the relay waits up to 20 seconds for it to come back before giving up.
 
 ## Building
 

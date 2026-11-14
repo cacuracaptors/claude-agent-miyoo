@@ -4,15 +4,23 @@
  * - Each Miyoo opens a WebSocket to its own Durable Object (DeviceRoom) and waits.
  * - Claude reaches the Miyoo through the MCP endpoint /mcp, signed in with OAuth.
  *   Signing in means typing the pairing code shown on the Miyoo's screen.
- * - The relay keeps no conversation content: tool calls and results only pass through.
+ * - The relay keeps no conversation content: tool calls and results only pass through. The one exception:
+ *   an answer that arrives after Claude's request was already answered (calls longer than HTTP_DEADLINE_MS)
+ *   is kept until wait_result picks it up, for LATE_KEEP_MS at most.
  */
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import { DurableObject } from 'cloudflare:workers';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const SCOPE = 'miyoo';
 const PAIR_CODE_TTL_MS = 10 * 60 * 1000;
 const MAX_TOOL_WAIT_MS = 720 * 1000;
+// Claude's side gives up on a request after about 100 s ("Bad Gateway"): answer before that. A call that
+// is still running on the Miyoo goes on there, and its answer is kept for wait_result.
+const HTTP_DEADLINE_MS = 75 * 1000;
+// the Miyoo's Wi-Fi can drop for a few seconds; a call waits this long for it to come back
+const RECONNECT_WAIT_MS = 20 * 1000;
+const LATE_KEEP_MS = 30 * 60 * 1000;
 
 const SERVER_INSTRUCTIONS = `These tools control a Miyoo Mini handheld (Linux, ARM, OnionOS or RedOnion) owned by the user you are talking to.
 - Start with device_info and a screenshot to see the state of the device.
@@ -25,6 +33,8 @@ const SERVER_INSTRUCTIONS = `These tools control a Miyoo Mini handheld (Linux, A
 - The user may be looking at the Miyoo rather than at this chat: after each answer, call show_message with a short plain-text version of it (what you found, what you did, what they should do next).
 - Launching games or leaving the app needs background_mode, which the user confirms on the device.
 - If developer tools are on (download_file, input_record, input_play, view_image, job_status, run_app, perf_monitor, screen_capture, watch_file, snapshot): use download_file for files bigger than a few hundred KB (for example from a GitHub release) instead of write_file; run_app to open a game or app and see how it ends (crash, output, core dump); input_record / input_play to repeat the same button presses with exact timing (start each run from the same save state); perf_monitor for CPU, clock and memory; snapshot before risky experiments. Long tasks continue as jobs: follow them with job_status. Work on your own as far as the user's request and the permissions allow. If the user asks for these and they are missing, they can turn them on in the app: START > Developer options. New tools appear in new chats.
+- When you work for more than about a minute without touching the device (reading, writing code, thinking through a problem), call set_status with a few words about what you are doing (in the language of the Miyoo's menus), so the person sees on the Miyoo that you are still working. Clear it (empty text) when you are done.
+- If a call says the Miyoo is reconnecting or has not answered yet, follow what it says (wait_result, or try again in a few seconds) before asking the person for help.
 - Do everything on the device yourself with these tools (run_command runs scripts on the Miyoo). Never ask the user to install programs on a computer or to use a terminal. If a step truly needs a computer (for example copying a large game to the SD card), say that it is an advanced step and explain it in simple numbered steps.`;
 
 /* ------------------------------------------------------------ helpers */
@@ -133,8 +143,9 @@ export class DeviceRoom extends DurableObject {
       if (p) {
         clearTimeout(p.timer);
         this.pending.delete(msg.id);
-        p.resolve(msg.result);
       }
+      if (p && p.resolve) p.resolve(msg.result);
+      else if (await this.ctx.storage.get('call:' + msg.id)) await this.keepLate(msg.id, msg.result);
     } else if (msg.type === 'pair_request') {
       const code = await pairingStub(this.env).create(await this.ctx.storage.get('deviceId'));
       ws.send(JSON.stringify({ type: 'pair_code', code, expires_in: PAIR_CODE_TTL_MS / 1000 }));
@@ -162,30 +173,141 @@ export class DeviceRoom extends DurableObject {
     return { tools: (await this.ctx.storage.get('tools')) || [], online: !!this.socket() };
   }
 
+  // the device's connection, waiting up to ms for it to come back (Wi-Fi drops, app restarts)
+  // (not: a connection that just failed, which may still be listed)
+  async waitSocket(ms, not = null) {
+    const until = Date.now() + ms;
+    let ws = this.socket();
+    while ((!ws || ws === not) && Date.now() < until) {
+      await new Promise((r) => setTimeout(r, 500));
+      ws = this.socket();
+    }
+    return ws === not ? null : ws;
+  }
+
+  // answers that arrived after Claude's request had already been answered (see wait_result)
+  async keepLate(id, result) {
+    await this.ctx.storage.put('late:' + id, { at: Date.now(), result });
+  }
+
+  async forgetOld() {
+    const now = Date.now();
+    const old = [];
+    for (const prefix of ['late:', 'call:']) {
+      const m = await this.ctx.storage.list({ prefix });
+      for (const [k, v] of m) if (now - (v?.at || 0) > LATE_KEEP_MS) old.push(k);
+    }
+    if (old.length) await this.ctx.storage.delete(old);
+  }
+
   async call(gen, tool, args, waitMs) {
     if (gen !== (await this.generation())) return { revoked: true };
-    const ws = this.socket();
+    let ws = await this.waitSocket(RECONNECT_WAIT_MS);
     if (!ws) return { offline: true };
-    const id = this.nextId++;
-    const result = await new Promise((resolve) => {
-      const timer = setTimeout(() => {
+    // ids stay unique even if this object restarts between calls
+    const id = (Date.now() % 1e10) * 100 + (this.nextId++ % 100);
+    await this.ctx.storage.put('call:' + id, { at: Date.now(), tool });
+    const started = Date.now();
+    const result = new Promise((resolve) => {
+      const p = { resolve, timer: null };
+      p.timer = setTimeout(() => {
         this.pending.delete(id);
-        resolve({
+        const r = {
           content: [{ type: 'text', text: `The device did not answer within ${Math.round(waitMs / 1000)} s.` }],
           isError: true,
-        });
+        };
+        if (p.resolve) p.resolve(r);
+        else this.keepLate(id, r);
       }, waitMs);
-      this.pending.set(id, { resolve, timer });
-      try {
-        ws.send(JSON.stringify({ type: 'call', id, tool, args: args || {} }));
-      } catch (e) {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        resolve({ content: [{ type: 'text', text: 'The connection to the device dropped.' }], isError: true });
-      }
+      this.pending.set(id, p);
     });
+    const msg = JSON.stringify({ type: 'call', id, tool, args: args || {} });
+    let sent = false;
+    for (let attempt = 0; attempt < 2 && !sent; attempt++) {
+      try {
+        ws.send(msg);
+        sent = true;
+      } catch {
+        // not delivered, so it is safe to send again on the new connection
+        ws = await this.waitSocket(RECONNECT_WAIT_MS, ws);
+        if (!ws) break;
+      }
+    }
+    if (!sent) {
+      const p = this.pending.get(id);
+      clearTimeout(p?.timer);
+      this.pending.delete(id);
+      await this.ctx.storage.delete('call:' + id);
+      return { offline: true };
+    }
+    const deadline = Math.max(1000, Math.min(waitMs, HTTP_DEADLINE_MS) - (Date.now() - started));
+    let timer;
+    const late = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), deadline);
+    });
+    const r = await Promise.race([result, late]);
+    clearTimeout(timer);
     await this.ctx.storage.put('lastSeen', Date.now());
-    return { result };
+    if (this.nextId % 20 === 0) this.forgetOld().catch(() => {});
+    if (r) {
+      await this.ctx.storage.delete('call:' + id);
+      return { result: r };
+    }
+    // still running on the device: its answer will be kept
+    const p = this.pending.get(id);
+    if (p) p.resolve = null;
+    const secs = Math.round((Date.now() - started) / 1000);
+    return {
+      result: {
+        content: [
+          {
+            type: 'text',
+            text:
+              `The Miyoo has not answered ${tool} yet after ${secs} s. It is probably still working on it, or waiting ` +
+              `for the person to allow it on its screen. Do not call ${tool} again: get its answer with ` +
+              `wait_result {"id": ${id}}.`,
+          },
+        ],
+      },
+    };
+  }
+
+  // the answer of a call that took longer than one request (see call)
+  async waitResult(gen, id, waitMs) {
+    if (gen !== (await this.generation())) return { revoked: true };
+    const until = Date.now() + Math.min(waitMs, HTTP_DEADLINE_MS);
+    for (;;) {
+      const late = await this.ctx.storage.get('late:' + id);
+      if (late) {
+        await this.ctx.storage.delete(['late:' + id, 'call:' + id]);
+        return { result: late.result };
+      }
+      const known = await this.ctx.storage.get('call:' + id);
+      if (!known)
+        return {
+          result: {
+            content: [{ type: 'text', text: `No call with id ${id} is waiting (answers are kept for 30 minutes, and given once).` }],
+            isError: true,
+          },
+        };
+      if (Date.now() >= until) {
+        const online = !!this.socket();
+        return {
+          result: {
+            content: [
+              {
+                type: 'text',
+                text:
+                  `${known.tool} (id ${id}) has not answered yet after ${Math.round((Date.now() - known.at) / 1000)} s` +
+                  (online ? '. It is still running on the Miyoo: call wait_result again (if it should have ended long ago, check the device with job_status or a screenshot).' :
+                    '. The Miyoo is offline right now; its answer arrives when it reconnects: call wait_result again in a moment.'),
+              },
+            ],
+          },
+        };
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
   }
 }
 
@@ -413,7 +535,19 @@ function rpcError(id, code, message) {
 }
 
 const offlineText =
-  'The Miyoo is not connected right now. Ask the user to turn on Wi-Fi on the Miyoo and open the Claude Agent app (Apps menu), then try again.';
+  'The Miyoo has not been connected for the last 20 s (its Wi-Fi may be reconnecting, or it may be asleep or off). Try again in a few seconds. Only if it still fails, ask the user to turn on Wi-Fi on the Miyoo and open the Claude Agent app (Apps menu).';
+
+// a tool of the relay itself, added to the Miyoo's tools
+const WAIT_RESULT_TOOL = {
+  name: 'wait_result',
+  description:
+    'Gets the answer of a call that took longer than one request (the call said to use wait_result and gave an id). Waits up to 70 s; if it is still running, call it again.',
+  inputSchema: {
+    type: 'object',
+    required: ['id'],
+    properties: { id: { type: 'integer' }, wait_s: { type: 'integer', description: 'default 70' } },
+  },
+};
 const revokedText = 'This connection was turned off on the Miyoo. The user has to connect again (pair with a new code).';
 
 async function handleRpc(msg, env, props) {
@@ -432,16 +566,22 @@ async function handleRpc(msg, env, props) {
     case 'tools/list': {
       const t = await room.tools(props.gen);
       if (t.revoked) return rpcError(id, -32001, revokedText);
-      return rpcResult(id, { tools: t.tools });
+      return rpcResult(id, { tools: [...t.tools, WAIT_RESULT_TOOL] });
     }
     case 'tools/call': {
       const name = params?.name;
       const args = params?.arguments || {};
-      // every call may first wait for the user to answer a permission question on the device (up to 90 s)
+      if (name === 'wait_result') {
+        const w = await room.waitResult(props.gen, Number(args.id), (Math.min(Number(args.wait_s) || 70, 70)) * 1000);
+        if (w.revoked) return rpcResult(id, { content: [{ type: 'text', text: revokedText }], isError: true });
+        return rpcResult(id, w.result);
+      }
+      // every call may first wait for the user to answer a permission question on the device (up to 90 s);
+      // past HTTP_DEADLINE_MS the request is answered and the result is kept for wait_result
       let wait = 60000;
       if (name === 'run_command') wait = (Math.min(Number(args.timeout_s) || 30, 600) + 15) * 1000;
       if (name === 'press_buttons') wait = 120000;
-      if (['download_file', 'input_play', 'run_app', 'perf_monitor', 'screen_capture', 'watch_file'].includes(name)) wait = 110000;
+      if (['download_file', 'input_play', 'run_app', 'perf_monitor', 'screen_capture', 'watch_file', 'job_status', 'input_record'].includes(name)) wait = 60000;
       wait += 95000;
       const r = await room.call(props.gen, name, args, Math.min(wait, MAX_TOOL_WAIT_MS));
       if (r.revoked) return rpcResult(id, { content: [{ type: 'text', text: revokedText }], isError: true });

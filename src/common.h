@@ -6,11 +6,12 @@
 
 extern char g_home[];
 
-#define AGENT_VERSION "1.0.1"
+#define AGENT_VERSION "1.0.2"
 #define UPDATE_STATUS "/tmp/claude_agent_update" /* state=, version=, note=... written by "update" */
 int update_main(int argc, char **argv);
 
 /* files in /tmp: gone when the device restarts */
+#define CLAUDE_STATUS "/tmp/claude_agent_status" /* set_status: "<until, monotonic s>\n<text>" */
 #define BG_FLAG "/tmp/claude_agent_background"     /* keep running after leaving the app */
 #define BG_REQUEST "/tmp/claude_agent_bg_request"  /* Claude asks for background mode */
 #define BG_ANSWER "/tmp/claude_agent_bg_answer"
@@ -45,6 +46,7 @@ int cpu_mhz_real(void); /* the clock the CPU really runs at (PLL), -1 if unknown
 
 cJSON *tool_show_message(cJSON *args);
 cJSON *tool_show_plan(cJSON *args);
+cJSON *tool_set_status(cJSON *args);
 /* backups.c: the backups folder */
 long long backups_kb(void);
 long long backups_empty(void);
@@ -69,6 +71,9 @@ int arg_bool(cJSON *args, const char *name, int def);
 int write_path_blocked(const char *path);
 int backup_file(const char *path, char *where, size_t wsize);
 int button_code(const char *name);
+int run_output_path(char *out, size_t size); /* output.log of the running run_app, -1 if none */
+void keys_hold(int on);            /* simulated buttons stay down: pause the button driver's polling */
+void keys_restore_poll(int force); /* put the polling back (force: even if its owner still runs) */
 const char *button_name(int code);
 
 typedef struct {

@@ -559,6 +559,9 @@ Gravação '%s' parada: %d eventos de botão
 Recording buttons as '%s'
 Gravando os botões como '%s'
 
+Recording '%s' from now
+Gravando '%s' a partir de agora
+
 Replay of %s %s: %d button events, %d screenshots
 Repetição de %s %s: %d eventos de botão, %d prints
 

@@ -962,6 +962,7 @@ typedef struct {
     long long bk_kb;              /* size of the backups folder, -1 = to measure */
     int focus; /* 0 = Claude pane, 1 = activity pane */
     long long busy_until;
+    char claude_status[200]; /* set_status: what Claude is doing away from the device */
     /* status bar: clock, Wi-Fi, battery */
     int bat, charging, wifi_q;
     long long next_sys;
@@ -1435,6 +1436,29 @@ static void draw(ui_t *u, pane_t *msg, pane_t *act)
     else {
         pane_draw(msg, u->focus == 0);
         pane_draw(act, u->focus == 1);
+        if (u->claude_status[0]) {
+            /* next to the ACTIVITY title: what Claude is doing while it works away from the device */
+            int x = act->x + 16 + text_width(act->title, 17) + 16;
+            int right = act->x + act->w - 16 - (act->follow ? 0 : text_width("newer below", 14) + 34);
+            char s[200];
+            snprintf(s, sizeof(s), "%s", u->claude_status);
+            int max = right - x - 14;
+            if (max > 40 && text_width_raw(s, 15) > max) {
+                size_t n = strlen(s);
+                while (n > 0) {
+                    do /* whole UTF-8 characters */
+                        n--;
+                    while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80);
+                    memcpy(s + n, "...", 4);
+                    if (text_width_raw(s, 15) <= max)
+                        break;
+                }
+            }
+            if (max > 40) {
+                round_box(x, act->y + 15, 7, 7, 3, C_ACCENT);
+                text_raw(x + 14, act->y + 10, s, 15, C_ACCENT);
+            }
+        }
         if (access(BG_FLAG, F_OK) == 0)
             text(ox + 24, oy + 424, "Keeps working after you leave the app", 14, C_ACCENT);
         int fx = ox + 24;
@@ -1702,13 +1726,25 @@ int ui_main(void)
         u.dlg = atoi(getenv("CA_UI_DLG"));
     if (getenv("CA_UI_WARN"))
         u.warn_item = atoi(getenv("CA_UI_WARN"));
-    char last_key[1400] = "";
+    char last_key[1700] = "";
     long long next_ip_check = 0, last_act_change = 0;
     int leave = 0, force = 1;
     while (!ui_stop && !leave) {
         snprintf(path, sizeof(path), "%s/status.txt", g_home);
         if (read_small(path, u.status, sizeof(u.status)) < 0)
             u.status[0] = 0;
+        {
+            /* set_status: "<until>\n<text>", until in monotonic seconds */
+            char cs[260];
+            u.claude_status[0] = 0;
+            if (read_small(CLAUDE_STATUS, cs, sizeof(cs)) > 0) {
+                char *nl = strchr(cs, '\n');
+                if (nl && atoll(cs) > now_ms() / 1000) {
+                    nl[1 + strcspn(nl + 1, "\n")] = 0;
+                    snprintf(u.claude_status, sizeof(u.claude_status), "%s", nl + 1);
+                }
+            }
+        }
         {
             /* updates: offer a new version once per power-on, follow a check or install started here */
             char ust[32], uv[64], later[64] = "";
@@ -1775,9 +1811,10 @@ int ui_main(void)
         if (u.dlg == DLG_PERM && access(PERM_ASK, F_OK) != 0)
             u.dlg = DLG_NONE; /* the question timed out */
 
-        char key[1400];
-        snprintf(key, sizeof(key), "%s|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d", u.status, u.ip, u.note, u.screen,
-                 u.set_sel, u.dlg, u.focus, msg.top, act.top, access(BG_FLAG, F_OK), u.warn_item);
+        char key[1700];
+        snprintf(key, sizeof(key), "%s|%s|%s|%d|%d|%d|%d|%d|%d|%d|%d|%s", u.status, u.ip, u.note, u.screen,
+                 u.set_sel, u.dlg, u.focus, msg.top, act.top, access(BG_FLAG, F_OK), u.warn_item,
+                 u.claude_status);
         int animating = now_ms() < u.busy_until;
         if (force || animating || strcmp(key, last_key) != 0) {
             draw(&u, &msg, &act);

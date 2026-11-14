@@ -48,6 +48,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <poll.h>
+#include <pthread.h>
 
 #include "cJSON.h"
 #include "common.h"
@@ -708,6 +709,121 @@ int button_code(const char *name)
     return -1;
 }
 
+/*
+ * Simulated buttons that stay down.
+ * The Miyoo's button driver (gpio-keys-polled) reports the real state of every button every 10 ms.
+ * A simulated press is therefore released by the driver's next report, within 10 ms: menus notice
+ * it, but games and emulators that look at the buttons once per frame (DraStic, GameSwitcher) miss
+ * it, and a hold never lasts. While simulated buttons are in use, the polling is paused (poll = 0)
+ * and put back afterwards; the person's own buttons do nothing meanwhile. The value to put back is
+ * kept in a file with the owner's pid, and a small guard process puts it back if the owner dies.
+ */
+#define KEYS_POLL_SAVED "/tmp/claude_agent_keys_poll"
+static pthread_mutex_t hold_lock = PTHREAD_MUTEX_INITIALIZER;
+static int hold_depth;
+
+static int alive(pid_t pid);
+
+static const char *keys_poll_path(void)
+{
+    return getenv("CA_KEYS_POLL") ? getenv("CA_KEYS_POLL") : "/sys/class/input/event0/device/poll";
+}
+
+static void write_str(const char *path, const char *s)
+{
+    int fd = open(path, O_WRONLY);
+    if (fd >= 0) {
+        if (write(fd, s, strlen(s)) < 0) {
+        }
+        close(fd);
+    }
+}
+
+void keys_restore_poll(int force)
+{
+    char v[32] = "";
+    int owner = 0;
+    FILE *f = fopen(KEYS_POLL_SAVED, "r");
+    if (!f)
+        return;
+    if (fscanf(f, "%31s %d", v, &owner) < 1)
+        v[0] = 0;
+    fclose(f);
+    if (!force && owner > 0 && owner != getpid() && alive(owner))
+        return; /* another process is still pressing buttons */
+    if (atoi(v) > 0)
+        write_str(keys_poll_path(), v);
+    unlink(KEYS_POLL_SAVED);
+}
+
+/* running, and not a zombie */
+static int alive(pid_t pid)
+{
+    char p[64], st[256];
+    if (kill(pid, 0) != 0)
+        return 0;
+    snprintf(p, sizeof(p), "/proc/%d/stat", (int)pid);
+    FILE *f = fopen(p, "r");
+    if (!f)
+        return 0;
+    size_t n = fread(st, 1, sizeof(st) - 1, f);
+    fclose(f);
+    st[n] = 0;
+    char *r = strrchr(st, ')');
+    return !(r && r[1] && r[2] == 'Z');
+}
+
+/* a process of its own (double fork: nothing to wait for) that puts the polling back if owner dies */
+static void keys_guard(pid_t owner)
+{
+    pid_t c = fork();
+    if (c == 0) {
+        if (fork() == 0) {
+            setsid();
+            for (int fd = 3; fd < 256; fd++)
+                close(fd);
+            while (access(KEYS_POLL_SAVED, F_OK) == 0 && alive(owner))
+                sleep(1);
+            if (!alive(owner))
+                keys_restore_poll(1);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    if (c > 0)
+        waitpid(c, NULL, 0);
+}
+
+void keys_hold(int on)
+{
+    pthread_mutex_lock(&hold_lock);
+    if (on) {
+        if (hold_depth++ == 0 && access(KEYS_POLL_SAVED, F_OK) != 0) {
+            char v[32] = "";
+            int fd = open(keys_poll_path(), O_RDONLY);
+            if (fd >= 0) {
+                ssize_t n = read(fd, v, sizeof(v) - 1);
+                close(fd);
+                v[n > 0 ? n : 0] = 0;
+                v[strcspn(v, "\r\n")] = 0;
+            }
+            if (atoi(v) > 0) {
+                FILE *f = fopen(KEYS_POLL_SAVED ".tmp", "w");
+                if (f) {
+                    fprintf(f, "%s %d\n", v, (int)getpid());
+                    fclose(f);
+                    rename(KEYS_POLL_SAVED ".tmp", KEYS_POLL_SAVED);
+                    keys_guard(getpid());
+                    write_str(keys_poll_path(), "0");
+                }
+            }
+        }
+    }
+    else if (hold_depth > 0 && --hold_depth == 0)
+        keys_restore_poll(1);
+    pthread_mutex_unlock(&hold_lock);
+}
+
 static int emit(int fd, int type, int code, int value)
 {
     struct input_event ev;
@@ -742,6 +858,7 @@ static cJSON *tool_press_buttons(cJSON *args)
     int fd = open(dev, O_WRONLY | O_APPEND | O_CREAT, 0644);
     if (fd < 0)
         return result_error("cannot open %s: %s", dev, strerror(errno));
+    keys_hold(1);
 
     char *copy = strdup(seq), *save = NULL;
     int presses = 0;
@@ -796,6 +913,7 @@ static cJSON *tool_press_buttons(cJSON *args)
         }
     }
     free(copy);
+    keys_hold(0);
     close(fd);
     if (err)
         return err;
@@ -1228,6 +1346,36 @@ cJSON *tool_show_message(cJSON *args)
     return r;
 }
 
+/* A line on the app's screen saying what Claude is doing while it works away from the device. */
+cJSON *tool_set_status(cJSON *args)
+{
+    const char *text = arg_str(args, "text", "");
+    int minutes = (int)arg_num(args, "minutes", 5);
+    if (minutes < 1)
+        minutes = 1;
+    if (minutes > 30)
+        minutes = 30;
+    cJSON *r = result_new();
+    if (!*text) {
+        unlink(CLAUDE_STATUS);
+        result_text(r, "Status cleared.");
+        return r;
+    }
+    char one[200];
+    snprintf(one, sizeof(one), "%s", text);
+    for (char *c = one; *c; c++) /* one line */
+        if (*c == '\n' || *c == '\r' || *c == '\t')
+            *c = ' ';
+    FILE *f = fopen(CLAUDE_STATUS ".tmp", "w");
+    if (!f)
+        return result_error("cannot write the status: %s", strerror(errno));
+    fprintf(f, "%lld\n%s\n", now_ms() / 1000 + minutes * 60, one);
+    fclose(f);
+    rename(CLAUDE_STATUS ".tmp", CLAUDE_STATUS);
+    result_textf(r, "Shown on the Miyoo for up to %d min (or until the next set_status).", minutes);
+    return r;
+}
+
 /* Claude's plan before a big change, shown on the Miyoo: the person accepts it (A) or not (B). */
 cJSON *tool_show_plan(cJSON *args)
 {
@@ -1335,6 +1483,8 @@ static const struct {
      "Press device buttons as if the user did. Sequence of tokens separated by spaces: "
      "A, MENU+POWER (together), DOWN*3 (repeat), A@1500 (hold 1500 ms), WAIT:500 (pause). "
      "Buttons: UP DOWN LEFT RIGHT A B X Y L1 R1 L2 R2 SELECT START MENU POWER VOLUP VOLDOWN. "
+     "Works in games and emulators too (holds stay down). The person's own buttons are ignored while the "
+     "sequence runs. MENU in a game opens OnionOS's GameSwitcher or quits the game. "
      "POWER may put the device to sleep or turn it off.",
      "{\"type\":\"object\",\"required\":[\"sequence\"],\"properties\":{"
      "\"sequence\":{\"type\":\"string\"},"
@@ -1378,6 +1528,14 @@ static const struct {
      "device_info, like pt-BR or es). The screen shows Latin, Greek and Cyrillic letters only: for Chinese, "
      "Japanese, Korean, Arabic and similar, write in English.",
      "{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\"}}}", 0},
+    {"set_status", tool_set_status,
+     "Show one short line on the Miyoo screen (in the Claude Agent app) about what you are doing, for example "
+     "\"Writing a fix for the menu\". Use it when you work for more than about a minute without touching the "
+     "device, so the person sees you are still working. Not logged in the messages. It disappears after "
+     "'minutes' (default 5, up to 30), when you set another one, or with empty text. Up to about 60 characters, "
+     "plain text, in the language of the Miyoo's menus.",
+     "{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\"},"
+     "\"minutes\":{\"type\":\"integer\"}}}", 0},
     {"show_plan", tool_show_plan,
      "Before a big or risky change (several files, system settings, installing or removing things, anything "
      "hard to undo), show your plan on the Miyoo screen and wait for the person to press A (go ahead) or B "
@@ -1394,7 +1552,7 @@ static const struct {
     {"download_file", tool_download_file,
      "Developer tool. The Miyoo downloads a file from an https address (for example a GitHub release asset or "
      "raw file) and saves it, checking it against sha256 if given. Use it for anything bigger than a few hundred KB "
-     "instead of write_file. An existing file is backed up first. Waits up to 100 s; longer downloads go on in "
+     "instead of write_file. An existing file is backed up first. Waits up to 50 s; longer downloads go on in "
      "the background as a job (see job_status).",
      "{\"type\":\"object\",\"required\":[\"url\",\"path\"],\"properties\":{"
      "\"url\":{\"type\":\"string\",\"description\":\"https://...\"},"
@@ -1406,18 +1564,29 @@ static const struct {
     {"input_record", tool_input_record,
      "Developer tool. Records every button the person presses on the Miyoo, with its time in ms, to replay "
      "it later with input_play exactly the same way (for example to test a game area twice with different "
-     "settings). action start (with a name), stop, or list. To record inside a game, background_mode must be on.",
+     "settings). action start (with a name), stop, or list. To record inside a game, background_mode must be on. "
+     "start_on: start counting only when this text appears in the output of the program run_app is running "
+     "(or in start_on_file), for example the line an emulator writes when a save state has loaded; replay it "
+     "with the same start_on.",
      "{\"type\":\"object\",\"properties\":{"
      "\"action\":{\"type\":\"string\",\"enum\":[\"start\",\"stop\",\"list\"]},"
      "\"name\":{\"type\":\"string\",\"description\":\"letters, digits, - and _\"},"
-     "\"max_s\":{\"type\":\"integer\",\"description\":\"stop by itself after this many seconds, default 600\"}}}", 1},
+     "\"max_s\":{\"type\":\"integer\",\"description\":\"stop by itself after this many seconds, default 600\"},"
+     "\"start_on\":{\"type\":\"string\"},\"start_on_file\":{\"type\":\"string\"},"
+     "\"start_timeout_s\":{\"type\":\"integer\",\"description\":\"default 90\"}}}", 1},
     {"input_play", tool_input_play,
      "Developer tool. Presses buttons with exact timing, from a recording (input_record) or from a timeline: a "
      "list of events with t = ms from the start: {\"t\":0,\"down\":\"RIGHT\"}, {\"t\":1500,\"tap\":\"A\",\"hold\":80}, "
      "{\"t\":3000,\"up\":\"RIGHT\"}, {\"t\":2000,\"shot\":\"label\"} (screenshot). Buttons can overlap freely. "
      "shots_at adds screenshots at given ms. Screenshots are saved as PNG (see them with view_image) without "
-     "delaying the buttons. Held buttons are released at the end. Games are not always deterministic: for fair "
-     "comparisons start each run from the same save state. Waits up to 100 s, then continues as a job.",
+     "delaying the buttons. Held buttons are released at the end. While it plays, the person's own buttons "
+     "are ignored (so they cannot disturb the test); cancel it with job_status if they need them. Leave MENU "
+     "out of game replays: in a game it opens the GameSwitcher or quits. Games are not always deterministic: "
+     "for fair comparisons start each run from the same save state. Loading times vary, so to start at the same "
+     "point of the game every time, use start_on: time 0 is when this text appears in the output of the program "
+     "run_app is running (start it with wait false just before), or in start_on_file (a log file; only lines "
+     "written after the call count); start_timeout_s (default 90). The person's buttons work until then. "
+     "Waits up to 50 s, then continues as a job.",
      "{\"type\":\"object\",\"properties\":{"
      "\"recording\":{\"type\":\"string\"},"
      "\"timeline\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},"
@@ -1425,6 +1594,8 @@ static const struct {
      "\"shots_dir\":{\"type\":\"string\",\"description\":\"default: the app's shots folder\"},"
      "\"start_at_first_press\":{\"type\":\"boolean\",\"description\":\"recording: skip the wait before the first press\"},"
      "\"allow_power\":{\"type\":\"boolean\"},"
+     "\"start_on\":{\"type\":\"string\"},\"start_on_file\":{\"type\":\"string\"},"
+     "\"start_timeout_s\":{\"type\":\"integer\"},"
      "\"wait\":{\"type\":\"boolean\",\"description\":\"default true\"}}}", 1},
     {"view_image", tool_view_image,
      "Developer tool. Shows you a picture saved on the device (PNG, JPEG, WEBP or GIF, up to 4 MB), for "
@@ -1433,7 +1604,7 @@ static const struct {
     {"job_status", tool_job_status,
      "Developer tool. Progress or result of a background job (download_file, input_record, input_play, run_app, "
      "perf_monitor, screen_capture, watch_file). "
-     "Without id, lists the jobs. cancel true stops it; wait_s waits up to 90 s for it to finish.",
+     "Without id, lists the jobs. cancel true stops it; wait_s waits up to 50 s for it to finish.",
      "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"cancel\":{\"type\":\"boolean\"},"
      "\"wait_s\":{\"type\":\"integer\"}}}", 1},
     {"run_app", tool_run_app,
@@ -1444,7 +1615,7 @@ static const struct {
      "(stop it after), watch_for (words to look for in the output) with stop_on_match, shots_every_ms + "
      "shots_start_ms + shots_count (screenshots while it runs), cpu_mhz (fix the CPU clock for the run, e.g. "
      "1600 to test like a Mini or Flip), env (environment variables), core_dump (default true). Combine with "
-     "input_play and perf_monitor (wait false) to test the same thing in the same way. Waits up to 100 s, then "
+     "input_play and perf_monitor (wait false) to test the same thing in the same way. Waits up to 50 s, then "
      "continues as a job.",
      "{\"type\":\"object\",\"properties\":{"
      "\"launch\":{\"type\":\"string\"},\"rom\":{\"type\":\"string\"},\"command\":{\"type\":\"string\"},"
@@ -1665,12 +1836,15 @@ int main(int argc, char **argv)
         }
     }
     else if (!strcmp(cmd, "ui")) {
+        keys_restore_poll(0); /* left paused by a process that died */
         return ui_main();
     }
     else if (!strcmp(cmd, "update")) {
         return update_main(argc, argv);
     }
     else if (!strcmp(cmd, "connect") || !strcmp(cmd, "unpair") || !strcmp(cmd, "server")) {
+        if (!strcmp(cmd, "connect"))
+            keys_restore_poll(0);
         return net_main(argc, argv);
     }
     else if (!strcmp(cmd, "keys") && argc >= 3) {
