@@ -386,12 +386,14 @@ static cJSON *tool_device_info(cJSON *args)
         pf, "notes",
         is_plus ? "Mini Plus: 3.5 inch 640x480 screen refreshing at about 59.7 Hz (measure it, do not assume 60). "
                   "CPU up to 1800 MHz. 128 MB RAM shared by the system, the game and this agent."
-        : is_flip ? "Mini Flip: 2.8 inch 640x480 screen with a lid (closing it sleeps the device). CPU up to "
+        : is_flip ? "Mini Flip: 752x560 screen with a lid (closing it sleeps the device). CPU up to "
                     "1600 MHz. 128 MB RAM."
         : is_v4 ? "Mini v4: 2.8 inch 752x560 screen (OnionOS can show 640x480 games scaled or centered). CPU up "
                   "to 1600 MHz. No Wi-Fi: this agent normally cannot run on it. 128 MB RAM."
                 : "Mini v2/v3: 2.8 inch 640x480 screen. CPU up to 1600 MHz. No Wi-Fi. 128 MB RAM.");
     cJSON_AddItemToObject(o, "profile", pf);
+    cJSON_AddStringToObject(o, "docs", "Notes for you on this device, OnionOS, DraStic, ports and these tools: "
+                                       "call docs (topic agent first).");
 
     /* firmware: RedOnion ships its own website.txt */
     char ver[64] = "", site[256] = "";
@@ -1376,6 +1378,59 @@ cJSON *tool_set_status(cJSON *args)
     return r;
 }
 
+/* Notes for Claude about the devices, the system, DraStic, ports and these tools: docs/<topic>.md in the app
+   folder, shipped with every version. Not shown to the person. */
+cJSON *tool_docs(cJSON *args)
+{
+    const char *topic = arg_str(args, "topic", "");
+    char dir[PATH_MAX + 8], path[PATH_MAX + 80];
+    snprintf(dir, sizeof(dir), "%s/docs", g_home);
+    cJSON *r = result_new();
+    if (!*topic) {
+        char list[2000] = "";
+        size_t n = 0;
+        DIR *d = opendir(dir);
+        struct dirent *e;
+        while (d && (e = readdir(d))) {
+            size_t l = strlen(e->d_name);
+            if (l < 4 || strcmp(e->d_name + l - 3, ".md"))
+                continue;
+            char title[200] = "";
+            snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                if (!fgets(title, sizeof(title), f))
+                    title[0] = 0;
+                fclose(f);
+            }
+            title[strcspn(title, "\r\n")] = 0;
+            if (n < sizeof(list) - 300)
+                n += snprintf(list + n, sizeof(list) - n, "%.*s: %s\n", (int)(l - 3), e->d_name,
+                              title[0] == '#' ? title + 2 : title);
+        }
+        if (d)
+            closedir(d);
+        result_textf(r, "Topics (docs {\"topic\": name}):\n%s", n ? list : "(none: the docs folder is missing)");
+        return r;
+    }
+    for (const char *c = topic; *c; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9') || *c == '-' || *c == '_'))
+            return result_error("unknown topic '%s' (docs without topic lists them)", topic);
+    snprintf(path, sizeof(path), "%s/%s.md", dir, topic);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return result_error("unknown topic '%s' (docs without topic lists them)", topic);
+    char *buf = malloc(65536);
+    size_t len = buf ? fread(buf, 1, 65535, f) : 0;
+    fclose(f);
+    if (!buf)
+        return result_error("out of memory");
+    buf[len] = 0;
+    result_text(r, buf);
+    free(buf);
+    return r;
+}
+
 /* Claude's plan before a big change, shown on the Miyoo: the person accepts it (A) or not (B). */
 cJSON *tool_show_plan(cJSON *args)
 {
@@ -1528,6 +1583,12 @@ static const struct {
      "device_info, like pt-BR or es). The screen shows Latin, Greek and Cyrillic letters only: for Chinese, "
      "Japanese, Korean, Arabic and similar, write in English.",
      "{\"type\":\"object\",\"required\":[\"text\"],\"properties\":{\"text\":{\"type\":\"string\"}}}", 0},
+    {"docs", tool_docs,
+     "Notes for you (not for the person) about this kind of device and how to work on it: how to use these tools "
+     "well (topic agent), the Miyoo hardware (hardware), OnionOS / RedOnion and where things are (onionos), the "
+     "DraStic emulator with frame-exact input replays (drastic), making and testing ports (ports). Read agent before "
+     "technical work, and the topic that matches the task. No topic lists them.",
+     "{\"type\":\"object\",\"properties\":{\"topic\":{\"type\":\"string\"}}}", 0},
     {"set_status", tool_set_status,
      "Show one short line on the Miyoo screen (in the Claude Agent app) about what you are doing, for example "
      "\"Writing a fix for the menu\". Use it when you work for more than about a minute without touching the "
@@ -1615,14 +1676,20 @@ static const struct {
      "(stop it after), watch_for (words to look for in the output) with stop_on_match, shots_every_ms + "
      "shots_start_ms + shots_count (screenshots while it runs), cpu_mhz (fix the CPU clock for the run, e.g. "
      "1600 to test like a Mini or Flip), env (environment variables), core_dump (default true). Combine with "
-     "input_play and perf_monitor (wait false) to test the same thing in the same way. Waits up to 50 s, then "
-     "continues as a job.",
+     "input_play and perf_monitor (wait false) to test the same thing in the same way. Stopping it (timeout, "
+     "cancel) lets the program save and quit (SIGTERM, up to 10 s). DraStic (Nintendo DS, launch = "
+     "/mnt/SDCARD/Emu/NDS/launch.sh): drastic_state (a .dss copied to the auto-load slot first, to start every run "
+     "from the same point), drastic_input_record / drastic_input_playback (a .ir file: DraStic's own frame-exact "
+     "recording of the buttons; the recording is saved when the run is stopped with cancel or timeout). See docs "
+     "topic drastic. Waits up to 50 s, then continues as a job.",
      "{\"type\":\"object\",\"properties\":{"
      "\"launch\":{\"type\":\"string\"},\"rom\":{\"type\":\"string\"},\"command\":{\"type\":\"string\"},"
      "\"timeout_s\":{\"type\":\"integer\"},\"watch_for\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},"
      "\"stop_on_match\":{\"type\":\"boolean\"},\"shots_every_ms\":{\"type\":\"integer\"},"
      "\"shots_start_ms\":{\"type\":\"integer\"},\"shots_count\":{\"type\":\"integer\"},"
      "\"cpu_mhz\":{\"type\":\"integer\"},\"env\":{\"type\":\"object\"},\"core_dump\":{\"type\":\"boolean\"},"
+     "\"drastic_state\":{\"type\":\"string\"},\"drastic_input_record\":{\"type\":\"string\"},"
+     "\"drastic_input_playback\":{\"type\":\"string\"},"
      "\"wait\":{\"type\":\"boolean\"}}}", 1},
     {"perf_monitor", tool_perf_monitor,
      "Developer tool. Measures CPU use and clock, free memory, battery and, if 'process' is given (its name, "

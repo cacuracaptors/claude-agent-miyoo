@@ -88,27 +88,108 @@ static pid_t pid_of(const char *name)
     return found;
 }
 
-/* children of pid (all levels), for stopping a program and what it started */
-static void kill_tree(pid_t pid, int sig)
+/* every process started by pid (all levels), pid included, with its parent */
+static int tree_pids(pid_t pid, pid_t parent, pid_t *out, pid_t *par, int n, int max)
 {
-    DIR *d = opendir("/proc");
-    if (d) {
-        struct dirent *e;
-        while ((e = readdir(d))) {
-            if (e->d_name[0] < '0' || e->d_name[0] > '9')
-                continue;
-            char p[64], st[512];
-            snprintf(p, sizeof(p), "/proc/%s/stat", e->d_name);
-            if (read_text(p, st, sizeof(st)) <= 0)
-                continue;
-            char *r = strrchr(st, ')');
-            int ppid = 0;
-            if (r && sscanf(r + 2, "%*c %d", &ppid) == 1 && ppid == pid)
-                kill_tree(atoi(e->d_name), sig);
-        }
-        closedir(d);
+    if (n < max) {
+        out[n] = pid;
+        par[n++] = parent;
     }
-    kill(pid, sig);
+    DIR *d = opendir("/proc");
+    if (!d)
+        return n;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9')
+            continue;
+        char p[64], st[512];
+        snprintf(p, sizeof(p), "/proc/%s/stat", e->d_name);
+        if (read_text(p, st, sizeof(st)) <= 0)
+            continue;
+        char *r = strrchr(st, ')');
+        int ppid = 0;
+        if (r && sscanf(r + 2, "%*c %d", &ppid) == 1 && ppid == pid)
+            n = tree_pids(atoi(e->d_name), pid, out, par, n, max);
+    }
+    closedir(d);
+    return n;
+}
+
+static int running(pid_t pid)
+{
+    char p[64], st[512];
+    if (kill(pid, 0) != 0)
+        return 0;
+    snprintf(p, sizeof(p), "/proc/%d/stat", (int)pid);
+    if (read_text(p, st, sizeof(st)) <= 0)
+        return 0;
+    char *r = strrchr(st, ')');
+    return !(r && r[1] && r[2] == 'Z');
+}
+
+static int tree_left(const pid_t *all, int n)
+{
+    int left = 0;
+    for (int i = 0; i < n; i++)
+        left += running(all[i]);
+    return left;
+}
+
+/* SIGTERM when the program's main thread is asleep (waiting for the next frame), up to 1 s for that moment.
+   DraStic saves its state from its SIGTERM handler, and crashes doing it if the signal arrives while it runs
+   emulated code (seen on the Mini Plus: 2 of 4 stops at a random moment crashed, 2 of 2 while asleep were clean). */
+static void term_between_frames(pid_t pid)
+{
+    char p[64], st[512];
+    snprintf(p, sizeof(p), "/proc/%d/task/%d/stat", (int)pid, (int)pid);
+    for (int i = 0; i < 1000; i++) {
+        if (read_text(p, st, sizeof(st)) <= 0)
+            break;
+        char *r = strrchr(st, ')');
+        if (r && r[1] && r[2] == 'S')
+            break;
+        usleep(1000);
+    }
+    kill(pid, SIGTERM);
+}
+
+/* Stops a run gently: SIGTERM to the programs (the game, not the shell scripts that wait for it), so the game can save and close its files (DraStic writes its state and input recording) and the launch
+   script can finish its own cleanup. Then SIGTERM to the rest, and SIGKILL for what is still there after wait_ms. */
+static void stop_tree(pid_t pid, int wait_ms)
+{
+    pid_t all[64], par[64];
+    int n = tree_pids(pid, 0, all, par, 0, 64), sent = 0;
+    for (int i = 0; i < n; i++) { /* the programs, not the shell scripts that run them */
+        char p[64], comm[32] = "";
+        snprintf(p, sizeof(p), "/proc/%d/comm", (int)all[i]);
+        read_text(p, comm, sizeof(comm));
+        comm[strcspn(comm, "\n")] = 0;
+        if (strcmp(comm, "sh") && strcmp(comm, "bash") && strcmp(comm, "ash") && strcmp(comm, "busybox")) {
+            term_between_frames(all[i]);
+            sent++;
+        }
+    }
+    for (int i = 0; i < n && !sent; i++) { /* only scripts: the ones at the end of the chain */
+        int leaf = 1;
+        for (int k = 0; k < n; k++)
+            if (par[k] == all[i])
+                leaf = 0;
+        if (leaf)
+            kill(all[i], SIGTERM);
+    }
+    int t = 0;
+    for (; t < wait_ms && tree_left(all, n); t += 100)
+        sleep_ms(100);
+    if (!tree_left(all, n))
+        return;
+    for (int i = n - 1; i >= 0; i--)
+        if (running(all[i]))
+            kill(all[i], SIGTERM);
+    for (; t < wait_ms + 2000 && tree_left(all, n); t += 100)
+        sleep_ms(100);
+    for (int i = 0; i < n; i++)
+        if (running(all[i]))
+            kill(all[i], SIGKILL);
 }
 
 /* screenshot to a PNG file, in its own thread so the caller keeps its timing */
@@ -365,11 +446,7 @@ static void *run_thread(void *arg)
         if (j->cancel || (r->timeout_s && now - start > r->timeout_s * 1000LL) ||
             (r->stop_on_match && matched)) {
             timed_out = !j->cancel && !(r->stop_on_match && matched);
-            kill_tree(pid, SIGTERM);
-            for (int i = 0; i < 20 && kill(pid, 0) == 0; i++)
-                sleep_ms(100);
-            if (kill(pid, 0) == 0)
-                kill_tree(pid, SIGKILL);
+            stop_tree(pid, 10000);
             sleep_ms(300);
             if (read_text(RUN_RC, b, sizeof(b)) > 0)
                 rc = atoi(b);
@@ -554,6 +631,82 @@ cJSON *tool_run_app(cJSON *args)
             snprintf(r->watch[r->nwatch++], 120, "%s", it->valuestring);
     }
     int mhz = (int)arg_num(args, "cpu_mhz", 0);
+
+    /* DraStic: a save state to start from, and its own frame-exact input record / playback */
+    const char *ds_state = arg_str(args, "drastic_state", NULL), *ds_rec = arg_str(args, "drastic_input_record", NULL),
+               *ds_play = arg_str(args, "drastic_input_playback", NULL);
+    char ds_launch[1100];
+    if (ds_state || ds_rec || ds_play) {
+        char edir[1024], bin[1100];
+        cJSON *e = NULL;
+        snprintf(edir, sizeof(edir), "%s", launch ? launch : "");
+        if (strrchr(edir, '/'))
+            *strrchr(edir, '/') = 0;
+        snprintf(bin, sizeof(bin), "%s/drastic", edir);
+        if (!launch || !rom || access(bin, F_OK) != 0)
+            e = result_error("the drastic_ options need launch (DraStic's launch.sh, in the folder of the drastic "
+                             "program, like /mnt/SDCARD/Emu/NDS/launch.sh) and rom");
+        else if (ds_rec && ds_play)
+            e = result_error("give drastic_input_record or drastic_input_playback, not both");
+        else if ((ds_rec && strchr(ds_rec, '\'')) || (ds_play && strchr(ds_play, '\'')))
+            e = result_error("the .ir path cannot contain '");
+        else if (ds_play && access(ds_play, F_OK) != 0)
+            e = result_error("%s does not exist", ds_play);
+        if (!e && ds_state) {
+            /* slot 10 is loaded at start: <rom file name without extension>_10.dss */
+            char name[300], dst[1400];
+            const char *b = strrchr(rom, '/') ? strrchr(rom, '/') + 1 : rom;
+            snprintf(name, sizeof(name), "%s", b);
+            if (strrchr(name, '.'))
+                *strrchr(name, '.') = 0;
+            snprintf(dst, sizeof(dst), "/mnt/SDCARD/Saves/CurrentProfile/states/Drastic/%s_10.dss", name);
+            char q1[1200], q2[1600], cmd[3000];
+            sq(q1, sizeof(q1), ds_state);
+            sq(q2, sizeof(q2), dst);
+            snprintf(cmd, sizeof(cmd), "cp -f %s %s && sync", q1, q2);
+            if (access(ds_state, F_OK) != 0)
+                e = result_error("%s does not exist", ds_state);
+            else if (system(cmd) != 0)
+                e = result_error("could not copy %s to %s", ds_state, dst);
+        }
+        if (!e && (ds_rec || ds_play)) {
+            /* a copy of launch.sh, in the same folder, that passes the option to drastic */
+            FILE *in = fopen(launch, "r");
+            char *text = NULL;
+            size_t len = 0;
+            if (in) {
+                text = malloc(256 * 1024);
+                len = text ? fread(text, 1, 256 * 1024 - 1, in) : 0;
+                fclose(in);
+                if (text)
+                    text[len] = 0;
+            }
+            const char *call = "./drastic \"$1\"";
+            char *at = text ? strstr(text, call) : NULL;
+            if (!at || strstr(at + 1, call))
+                e = result_error("%s does not start drastic with ./drastic \"$1\" exactly once, so the option "
+                                 "cannot be added", launch);
+            else {
+                snprintf(ds_launch, sizeof(ds_launch), "%s/.claude_launch.sh", edir);
+                FILE *out = fopen(ds_launch, "w");
+                if (!out)
+                    e = result_error("cannot write %s", ds_launch);
+                else {
+                    fwrite(text, 1, at - text, out);
+                    fprintf(out, "./drastic %s '%s' \"$1\"", ds_rec ? "--input-record" : "--input-playback",
+                            ds_rec ? ds_rec : ds_play);
+                    fputs(at + strlen(call), out);
+                    fclose(out);
+                    launch = ds_launch;
+                }
+            }
+            free(text);
+        }
+        if (e) {
+            free(r);
+            return e;
+        }
+    }
 
     /* the wrapper: same environment as OnionOS, output kept, exit code noted */
     char script[1100];

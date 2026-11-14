@@ -13,11 +13,12 @@ docker exec miyoomini-toolchain-debug sh /root/workspace/claude-agent/build.sh |
 P=package/App/ClaudeAgent
 S=dist/stage/App/ClaudeAgent
 rm -rf dist/stage
-mkdir -p $S/lang
+mkdir -p $S/lang $S/docs
 for f in claude-agent cacert.pem config.json launch.sh wifi.sh icon.png; do
     cp "$P/$f" "$S/"
 done
 cp "$P"/lang/*.txt "$S/lang/"
+cp "$P"/docs/*.md "$S/docs/"
 Z="ClaudeAgent-v$V.zip"
 rm -f "dist/$Z"
 (cd dist/stage && python3 -m zipfile -c "../$Z" App)

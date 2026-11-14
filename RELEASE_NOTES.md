@@ -1,13 +1,19 @@
-Buttons that games see, steadier connection, and a status line.
+## v1.0.3 - Exact replays in DraStic + built-in notes for Claude
 
-- **Simulated buttons now work in games and emulators.** The Miyoo's button driver re-reads the real buttons every 10 ms, so a button pressed by Claude was let go almost at once: menus noticed it, but games (DraStic, the GameSwitcher) did not, and a held button never stayed held. While Claude presses buttons (`press_buttons`, `input_play`) that re-reading now pauses, and it comes back right after, even if the app is closed in the middle. Your own buttons do nothing during that time.
-- **`input_play` and `input_record` can start counting from a line of the game's output** (`start_on`), for example the line an emulator writes when a save state has loaded. Loading times vary, so this keeps every button press at the same moment of the game, run after run.
-- **`run_app` reports crashes of the game itself.** Launch scripts often end normally even when the game they started crashed; the crash (which program, which signal) and out-of-memory kills are now reported.
-- **A short line next to *Activity* shows what Claude is doing** when it works for a while without touching the Miyoo (`set_status`), so the app does not look stuck.
-- **Short Wi-Fi drops no longer break Claude's work.** The relay waits up to 20 s for the Miyoo to reconnect instead of failing at once.
-- **No more "Bad Gateway" on long tests.** Long tools answer within 50 s and go on as jobs; an answer that takes longer is kept by the relay until Claude asks for it (`wait_result`).
-- If a game was left in the GameSwitcher (MENU pressed during a test), `run_app` now says so, instead of only saying the app could not reopen.
+### New
+- Frame-exact replays in DraStic (Nintendo DS). `run_app` can put a save state in DraStic's auto-load slot before each run (`drastic_state`) and use DraStic's own input recording (`drastic_input_record`, `drastic_input_playback`), which applies every button change on the same emulated frame: a recorded play repeats exactly, for benchmarks and bug reports.
+- Built-in notes for Claude (`docs`): how to use the app's tools well, the Miyoo hardware, how OnionOS and RedOnion work and where things are, DraStic, and making and testing ports. Claude reads them before technical work instead of rediscovering the device in every chat.
 
-**Install:** download `ClaudeAgent-v1.0.2.zip` below and extract it to the root of the SD card, or, if you already have Claude Agent, update from the app: *Settings > Check for updates*.
+### Improvements
+- Stopping a test (time limit or cancel) now lets the game save and quit: the game gets the signal first and has up to 10 s, and its launch script finishes its own cleanup.
+- `job_status` no longer shows finished jobs as still running.
 
-The relay changed too: if you run your own, publish it again (`bash server/deploy.sh`).
+### Fixes
+- The Mini Flip's screen was described as 640x480; it is 752x560.
+
+### Updating
+- From v1.0.0 to v1.0.2: use *Settings > Check for updates* in the app.
+- Or download `ClaudeAgent-v1.0.3.zip` below and extract it to the root of the SD card.
+- Your settings, connection and backups are kept.
+- The new `docs` tool appears in new Claude chats.
+- If you run your own relay, publish it again (`bash server/deploy.sh`).

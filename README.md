@@ -80,6 +80,8 @@ To see the full format, ask Claude to show the plugin docs (the `plugins` tool w
 | `snapshot` | Saves a folder (like a save folder) and restores it later |
 | `plugin_create` / `plugins` | Creates and manages [plugins](#plugins) |
 
+Claude also has built-in notes about the Miyoo hardware, OnionOS and RedOnion, DraStic and making ports (the `docs` tool, files in `app/docs/`), so it does not have to rediscover how the device works in every chat. For DraStic, `run_app` can start every run from the same save state and use DraStic's own frame-exact input recording, so a test or a bug can be replayed exactly.
+
 ## Languages
 
 The app follows the language set in the Miyoo's menu. Translations live in `app/lang/<language>.txt` as pairs of lines (the English text, then the translation). Right now: English, Português (Brasil), Español. New translations are welcome: copy `pt-BR.txt`, translate the second line of each pair, and open a pull request. Latin, Greek and Cyrillic letters are supported.

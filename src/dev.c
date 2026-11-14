@@ -159,7 +159,11 @@ cJSON *tool_job_status(cJSON *args)
         pthread_mutex_lock(&jobs_lock);
         for (job_t *j = jobs; j && n < sizeof(buf) - 400; j = j->next)
             n += snprintf(buf + n, sizeof(buf) - n, "job %d [%s] %s: %s\n", j->id,
-                          j->done ? "finished" : "running", j->what, j->progress);
+                          j->done ? "finished" : "running", j->what,
+                          j->done && (!strncmp(j->progress, "running", 7) || !strncmp(j->progress, "waiting", 7) ||
+                                      !strncmp(j->progress, "starting", 8) || !strncmp(j->progress, "recording", 9))
+                              ? "ended (job_status with its id gives the result)"
+                              : j->progress);
         pthread_mutex_unlock(&jobs_lock);
         result_text(r, n ? buf : "No jobs since the agent started.");
         return r;

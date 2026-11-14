@@ -6,7 +6,7 @@
 
 extern char g_home[];
 
-#define AGENT_VERSION "1.0.2"
+#define AGENT_VERSION "1.0.3"
 #define UPDATE_STATUS "/tmp/claude_agent_update" /* state=, version=, note=... written by "update" */
 int update_main(int argc, char **argv);
 
@@ -47,6 +47,7 @@ int cpu_mhz_real(void); /* the clock the CPU really runs at (PLL), -1 if unknown
 cJSON *tool_show_message(cJSON *args);
 cJSON *tool_show_plan(cJSON *args);
 cJSON *tool_set_status(cJSON *args);
+cJSON *tool_docs(cJSON *args);
 /* backups.c: the backups folder */
 long long backups_kb(void);
 long long backups_empty(void);

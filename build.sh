@@ -72,6 +72,8 @@ cp third_party/cacert.pem $OUT/cacert.pem
 cp app/config.json app/launch.sh app/wifi.sh $OUT/
 mkdir -p $OUT/lang
 cp app/lang/*.txt $OUT/lang/
+mkdir -p $OUT/docs
+cp app/docs/*.md $OUT/docs/
 base64 -d app/icon.png.b64 > $OUT/icon.png
 chmod +x $OUT/launch.sh $OUT/wifi.sh $OUT/claude-agent
 echo "OK"
