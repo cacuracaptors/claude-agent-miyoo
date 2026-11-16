@@ -117,3 +117,7 @@ To use your own relay: `server/deploy.sh` publishes it on your Cloudflare accoun
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## AI-Assisted
+
+Claude Opus 5.5 was used to write most of the code and to speed up debugging and optimization. Even though I'm no software engineer, I have a background in the modding community, so I understand how basic rendering tricks work. I don't write complex code myself (that's why I use Claude) but I understand how its logic works and what's going on most of the time, so I can control what Claude is doing more tightly.
